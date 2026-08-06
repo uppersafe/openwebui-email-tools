@@ -4,8 +4,9 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.0.0
+version: 1.1.0
 required_open_webui_version: 0.10.2
+requirements: imapclient
 """
 
 import os
@@ -13,18 +14,20 @@ import io
 import re
 import time
 import json
-import stat
 import unicodedata
 import mimetypes
 import asyncio
 import logging
 import ssl
-import imaplib
-import email
 from hashlib import blake2b
 from difflib import SequenceMatcher
 from fastapi import Request, UploadFile
 from pydantic import BaseModel, Field
+from email import policy, message_from_bytes
+from email.utils import getaddresses, parsedate_to_datetime
+from email.message import EmailMessage
+from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientError, LoginError
 
 from open_webui.models.config import Config
 from open_webui.models.files import Files
@@ -41,7 +44,7 @@ from open_webui.routers.retrieval import (
 log = logging.getLogger(__name__)
 
 
-class MailException(Exception):
+class MailException(IMAPClientError):
     def __init__(self, message, error=None):
         super().__init__(message)
         self.error = error
@@ -58,90 +61,94 @@ class MailClient:
         if not verify:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-        self.imap = imaplib.IMAP4_SSL(
+        self.imap = IMAPClient(
             host=host,
             port=port,
+            use_uid=True,
+            ssl=True,
             ssl_context=ssl_context,
             timeout=10,
         )
         self.mailbox = None
 
     def login(self, mailaddr: str, password: str) -> None:
-        response, data = self.imap.login(mailaddr, password)
-        if response != "OK":
-            raise MailException(f"Invalid username or password", response)
+        try:
+            self.imap.login(mailaddr, password)
+        except LoginError as e:
+            raise MailException("Invalid username or password", e)
+        except IMAPClientError as e:
+            raise MailException("Unable to login", e)
 
     def logout(self) -> None:
-        response, data = self.imap.logout()
-        if response != "BYE":
-            raise MailException(f"Unable to logout", response)
+        try:
+            self.imap.logout()
+        except IMAPClientError as e:
+            raise MailException("Unable to logout", e)
 
     def list(self, ignore: list = []) -> list:
-        response, data = self.imap.list()
-        if response != "OK":
-            raise MailException(f"Unable to list mailboxes", response)
+        try:
+            data = self.imap.list_folders()
+            if not isinstance(data, list):
+                raise MailException("Unable to parse response data", data)
+        except IMAPClientError as e:
+            raise MailException("Unable to list mailboxes", e)
 
         mailboxes = []
 
-        if not isinstance(data, list):
-            raise MailException(f"Unable to parse response data", data)
-
-        for element in data:
-            match = re.search(r'(".*"|[^\s]+)$', element.decode())
-            if match is not None:
-                mailbox = match.group(1)
-                if mailbox.upper() not in ignore:
-                    mailboxes.append(mailbox)
+        for flags, delimiter, mailbox in data:
+            if mailbox.upper() not in ignore:
+                mailboxes.append(mailbox)
 
         return mailboxes
 
     def select(self, mailbox: str) -> None:
-        response, data = self.imap.select(mailbox, readonly=True)
-        if response != "OK":
-            raise MailException(f"Unable to select mailbox {mailbox}", response)
+        try:
+            self.imap.select_folder(mailbox, readonly=True)
+        except IMAPClientError as e:
+            raise MailException(f"Unable to select mailbox {mailbox}", e)
 
         self.mailbox = mailbox
 
-    def search(self, mailbox: str, pattern: str) -> list:
+    def search(self, mailbox: str, criteria: list) -> list:
         if mailbox != self.mailbox:
             self.select(mailbox)
 
-        response, data = self.imap.uid("SEARCH", "CHARSET", "UTF-8", pattern.encode())
-        if response != "OK":
-            raise MailException(f"Unable to search mailbox {mailbox}", response)
+        try:
+            data = self.imap.search(criteria, charset="UTF-8")
+            if not isinstance(data, list):
+                raise MailException("Unable to parse response data", data)
+        except IMAPClientError as e:
+            raise MailException(f"Unable to search mailbox {mailbox}", e)
 
-        if not isinstance(data, list) or not isinstance(data[0], bytes):
-            raise MailException(f"Unable to parse response data", data)
-
-        if len(data[0]) != 0:
-            return data[0].decode().split(" ")
-
-        return []
+        return data
 
     def fetch(
         self,
         mailbox: str,
-        uid: str,
+        uid: int,
         raw: bool = False,
-    ) -> email.message.Message | bytes:
+    ) -> EmailMessage | bytes:
         if mailbox != self.mailbox:
             self.select(mailbox)
 
         # TODO: retrieve only (BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM TO CC)])
-        response, data = self.imap.uid("FETCH", uid, "(BODY.PEEK[])")
-        if response != "OK":
-            raise MailException(
-                f"Unable to fetch message {uid} from mailbox {mailbox}", response
-            )
-
-        if not isinstance(data, list) or not isinstance(data[0], tuple):
-            raise MailException(f"Unable to parse response data", data)
+        try:
+            data = self.imap.fetch([uid], ["BODYSTRUCTURE", "BODY.PEEK[]"])
+            if not isinstance(data, dict):
+                raise MailException("Unable to parse response data", data)
+            data = data.get(uid, None)
+            if not isinstance(data, dict):
+                raise MailException("Unable to parse response data", data)
+            data = data.get(b"BODY[]", None)
+            if not isinstance(data, bytes):
+                raise MailException("Unable to parse response data", data)
+        except IMAPClientError as e:
+            raise MailException(f"Unable to fetch msg {uid} from mailbox {mailbox}", e)
 
         if not raw:
-            policy = email.policy.default
-            return email.message_from_bytes(data[0][1], policy=policy)
+            return message_from_bytes(data, policy=policy.default)
 
-        return data[0][1]
+        return data
 
 
 class Tools:
@@ -220,14 +227,14 @@ class Tools:
         results = []
         timeout = timeout or int(time.monotonic() + self.valves.search_timeout)
 
-        # Build search keywords
-        keywords = self._build_keywords(query)
+        # Extract search keywords
+        keywords = self._extract_keywords(query)
 
-        # Compile search pattern
-        pattern = self._compile_keywords(keywords)
+        # Build search criteria
+        criteria = self._build_criteria(keywords)
 
         # Look for unread messages only
-        pattern = f"(UNSEEN {pattern})" if unread else pattern
+        criteria = ["UNSEEN", criteria] if unread else criteria
 
         # Retrieve mailboxes
         if len(mailboxes) == 0:
@@ -241,7 +248,7 @@ class Tools:
                     )
 
                 # Search for messages
-                uids = session.search(mailbox, pattern)
+                uids = session.search(mailbox, criteria)
 
                 for uid in uids:
                     # Fetch message by UID
@@ -269,7 +276,7 @@ class Tools:
                     ccs = msg.get_all("Cc", [])
 
                     recipients = []
-                    for name, addr in set(email.utils.getaddresses(tos + ccs)):
+                    for name, addr in set(getaddresses(tos + ccs)):
                         recipients.append(f"{name} <{addr}>")
 
                     if subject is not None and date is not None:
@@ -293,7 +300,7 @@ class Tools:
         # Sort results and return best matches
         return self._sort_results(results)
 
-    def _download_imap(self, session, mailbox: str, uid: str) -> bytes:
+    def _download_imap(self, session, mailbox: str, uid: int) -> bytes:
         return session.fetch(mailbox, uid, raw=True)
 
     def _get_credentials(self, config: dict) -> dict:
@@ -329,7 +336,7 @@ class Tools:
     def _score_message(
         self,
         mailbox: str,
-        uid: str,
+        uid: int,
         content: str,
         date: str,
         subject: str,
@@ -390,17 +397,12 @@ class Tools:
         return {
             "subject": subject.strip(),
             "path": f'/{mailbox}/{uid}/{subject.strip().replace("/", "-")}.eml',
-            "timestamp": email.utils.parsedate_to_datetime(date).timestamp(),
+            "timestamp": parsedate_to_datetime(date).timestamp(),
             "sender": sender.strip(),
             "recipients": recipients,
             "attachments": attachments,
             "search_score": score,
         }
-
-    def _is_media(self, mimetype: str) -> bool:
-        if mimetype is not None:
-            return mimetype.startswith(("image/", "audio/", "video/"))
-        return False
 
     def _sort_results(self, results: list) -> list:
         return sorted(
@@ -409,15 +411,20 @@ class Tools:
             reverse=True,
         )[: self.valves.search_count]
 
-    def _compile_keywords(self, keywords: list) -> str:
-        if len(keywords) >= 1:
-            keyword = f"(TEXT {json.dumps(keywords[0], ensure_ascii=False)})"
-            if len(keywords) >= 2:
-                return f"(OR {keyword} {self._compile_keywords(keywords[1:])})"
-            return keyword
-        return "(ALL)"
+    def _is_media(self, mimetype: str) -> bool:
+        if mimetype is not None:
+            return mimetype.startswith(("image/", "audio/", "video/"))
+        return False
 
-    def _build_keywords(self, query: str) -> list:
+    def _build_criteria(self, keywords: list) -> list:
+        if len(keywords) >= 1:
+            keyword = ["TEXT", keywords[0]]
+            if len(keywords) >= 2:
+                return ["OR", keyword, self._build_criteria(keywords[1:])]
+            return keyword
+        return ["ALL"]
+
+    def _extract_keywords(self, query: str) -> list:
         if query is None or len(query) == 0:
             return []
 

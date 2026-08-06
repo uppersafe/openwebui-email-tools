@@ -4,7 +4,7 @@ Search on mail server for information and fetch specific message content using O
 
 ## Features
 
-- Extracts keywords from search query and builds search pattern.
+- Extracts keywords from search query and builds search criteria.
 - Searches for messages in specified mailboxes.
 - Ranks results using similarity scoring and email date.
 - Downloads messages and processes content.
@@ -95,6 +95,13 @@ When `port` is not set, the protocol default port (`993`) is used.
 Tested with **Open WebUI 0.10.2**.
 
 The tool imports internal Open WebUI modules, so compatibility with earlier or later releases is not guaranteed.
+
+## Requirements
+
+Allow Open WebUI to install listed requirements (set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS` to `true` and `OFFLINE_MODE` to `false`).
+
+The tool relies on a 3rd party Python package:
+- [imapclient](https://github.com/mjs/imapclient)
 
 ## License
 
