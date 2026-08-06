@@ -88,7 +88,6 @@ When `port` is not set, the protocol default port (`993`) is used.
 ## Security
 
 - Enable encryption to store credentials (set a strong `WEBUI_SECRET_KEY` and set `ENABLE_VALVE_ENCRYPTION` to `true`).
-- Do not use an administrator account.
 - Restrict network access between Open WebUI and the mail server.
 
 ## Compatibility
