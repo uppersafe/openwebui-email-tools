@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.1.0
+version: 1.2.0
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
