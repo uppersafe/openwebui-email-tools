@@ -23,10 +23,10 @@ from hashlib import blake2b
 from difflib import SequenceMatcher
 from fastapi import Request, UploadFile
 from pydantic import BaseModel, Field
-from email import policy, message_from_bytes
-from email.utils import getaddresses, parsedate_to_datetime
-from email.message import EmailMessage
+from email.header import decode_header, make_header
+from email.utils import getaddresses
 from imapclient import IMAPClient
+from imapclient.response_types import Envelope, BodyData
 from imapclient.exceptions import IMAPClientError, LoginError
 
 from open_webui.models.config import Config
@@ -109,12 +109,19 @@ class MailClient:
 
         self.mailbox = mailbox
 
-    def search(self, mailbox: str, criteria: list) -> list:
+    def search(self, mailbox: str, criteria: str) -> list:
         if mailbox != self.mailbox:
             self.select(mailbox)
 
         try:
-            data = self.imap.search(criteria, charset="UTF-8")
+            # Rely on imaplib rather than imapclient search function to send raw criteria
+            # data = self.imap.search(criteria, charset="UTF-8")
+            response, data = self.imap._imap.uid(
+                "SEARCH", "CHARSET", "UTF-8", criteria.encode()
+            )
+            if response != "OK":
+                raise MailException("Unable to parse response data", data)
+            data = list(map(int, data[0].decode().split(" "))) if len(data[0]) else []
             if not isinstance(data, list):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
@@ -122,33 +129,113 @@ class MailClient:
 
         return data
 
-    def fetch(
+    def fetch_raw(
         self,
         mailbox: str,
         uid: int,
-        raw: bool = False,
-    ) -> EmailMessage | bytes:
+    ) -> bytes:
         if mailbox != self.mailbox:
             self.select(mailbox)
 
-        # TODO: retrieve only (BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM TO CC)])
         try:
-            data = self.imap.fetch([uid], ["BODYSTRUCTURE", "BODY.PEEK[]"])
+            data = self.imap.fetch([uid], ["BODY.PEEK[]"])
             if not isinstance(data, dict):
                 raise MailException("Unable to parse response data", data)
             data = data.get(uid, None)
             if not isinstance(data, dict):
                 raise MailException("Unable to parse response data", data)
-            data = data.get(b"BODY[]", None)
-            if not isinstance(data, bytes):
+        except IMAPClientError as e:
+            raise MailException(f"Unable to fetch msg {uid} from mailbox {mailbox}", e)
+
+        return data.get(b"BODY[]", None)
+
+    def fetch_metadata(
+        self,
+        mailbox: str,
+        uid: int,
+    ) -> tuple:
+        if mailbox != self.mailbox:
+            self.select(mailbox)
+
+        try:
+            data = self.imap.fetch([uid], ["ENVELOPE", "BODYSTRUCTURE"])
+            if not isinstance(data, dict):
+                raise MailException("Unable to parse response data", data)
+            data = data.get(uid, None)
+            if not isinstance(data, dict):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
             raise MailException(f"Unable to fetch msg {uid} from mailbox {mailbox}", e)
 
-        if not raw:
-            return message_from_bytes(data, policy=policy.default)
+        envelope = data.get(b"ENVELOPE", None)
+        bodystructure = data.get(b"BODYSTRUCTURE", None)
 
-        return data
+        return self.get_headers(envelope), self.get_attachments(bodystructure)
+
+    def get_headers(self, envelope: Envelope) -> dict:
+        headers = {}
+        if envelope.date is not None:
+            headers.update(
+                {
+                    "Date": envelope.date,
+                }
+            )
+        if envelope.subject is not None:
+            headers.update(
+                {
+                    "Subject": str(
+                        make_header(decode_header(envelope.subject.decode()))
+                    ),
+                }
+            )
+        if envelope.from_ is not None:
+            headers.update(
+                {
+                    "From": [
+                        str(make_header(decode_header(address)))
+                        for address in map(str, envelope.from_)
+                    ],
+                }
+            )
+        if envelope.to is not None:
+            headers.update(
+                {
+                    "To": [
+                        str(make_header(decode_header(address)))
+                        for address in map(str, envelope.to)
+                    ],
+                }
+            )
+        if envelope.cc is not None:
+            headers.update(
+                {
+                    "Cc": [
+                        str(make_header(decode_header(address)))
+                        for address in map(str, envelope.cc)
+                    ],
+                }
+            )
+        return headers
+
+    def get_attachments(self, part: BodyData) -> list:
+        attachments = []
+        if part.is_multipart and isinstance(part[0], list):
+            for subpart in part[0]:
+                attachments.extend(self.get_attachments(subpart))
+        else:
+            for element in part:
+                if isinstance(element, tuple) and isinstance(element[0], bytes):
+                    if element[0].decode().lower() in [
+                        "attachment",
+                        "inline",
+                    ]:
+                        if isinstance(element[1], tuple) and len(element[1]) % 2 == 0:
+                            for key, value in zip(element[1][0::2], element[1][1::2]):
+                                if key.decode().lower() == "filename":
+                                    attachments.append(
+                                        str(make_header(decode_header(value.decode())))
+                                    )
+        return attachments
 
 
 class Tools:
@@ -234,7 +321,7 @@ class Tools:
         criteria = self._build_criteria(keywords)
 
         # Look for unread messages only
-        criteria = ["UNSEEN", criteria] if unread else criteria
+        criteria = f"(UNSEEN {criteria})" if unread else criteria
 
         # Retrieve mailboxes
         if len(mailboxes) == 0:
@@ -251,40 +338,23 @@ class Tools:
                 uids = session.search(mailbox, criteria)
 
                 for uid in uids:
-                    # Fetch message by UID
-                    msg = session.fetch(mailbox, uid)
+                    # Fetch message metadata by UID
+                    headers, attachments = session.fetch_metadata(mailbox, uid)
 
-                    attachments = []
-                    for part in msg.walk():
-                        if not part.is_multipart():
-                            content_type = part.get_content_type()
-                            content_disposition = part.get_content_disposition()
-                            if content_disposition in ["attachment", "inline"]:
-                                filename = part.get_filename()
-                                if filename is not None:
-                                    # content = part.get_content()
-                                    attachments.append(filename)
-
-                    body = msg.get_body(preferencelist=("plain", "html"))
-                    content_type = body.get_content_type()
-                    content = body.get_content()
-
-                    date = msg.get("Date")
-                    subject = msg.get("Subject")
-                    sender = msg.get("From")
-                    tos = msg.get_all("To", [])
-                    ccs = msg.get_all("Cc", [])
-
+                    date = headers.get("Date", None)
+                    subject = headers.get("Subject", None)
+                    sender = next(iter(headers.get("From", [None])))
+                    tos = headers.get("To", [])
+                    ccs = headers.get("Cc", [])
                     recipients = []
                     for name, addr in set(getaddresses(tos + ccs)):
                         recipients.append(f"{name} <{addr}>")
 
-                    if subject is not None and date is not None:
+                    if subject is not None and date is not None and sender is not None:
                         results.append(
                             self._score_message(
                                 mailbox,
                                 uid,
-                                content,
                                 date,
                                 subject,
                                 sender,
@@ -301,7 +371,7 @@ class Tools:
         return self._sort_results(results)
 
     def _download_imap(self, session, mailbox: str, uid: int) -> bytes:
-        return session.fetch(mailbox, uid, raw=True)
+        return session.fetch_raw(mailbox, uid)
 
     def _get_credentials(self, config: dict) -> dict:
         if config.mailaddr is None:
@@ -337,7 +407,6 @@ class Tools:
         self,
         mailbox: str,
         uid: int,
-        content: str,
         date: str,
         subject: str,
         sender: str,
@@ -353,12 +422,6 @@ class Tools:
 
         # Calculate the weight of one character
         match_weight = 1.0 / max(1.0, total_length)
-
-        # Calculate match with content
-        score = score + sum(
-            match_size * match_weight
-            for match_size in self._seq_match(content, keywords)
-        )
 
         # Calculate match with subject
         score = score + sum(
@@ -395,10 +458,10 @@ class Tools:
             )
 
         return {
-            "subject": subject.strip(),
-            "path": f'/{mailbox}/{uid}/{subject.strip().replace("/", "-")}.eml',
-            "timestamp": parsedate_to_datetime(date).timestamp(),
-            "sender": sender.strip(),
+            "subject": subject,
+            "path": f'/{mailbox}/{uid}/{subject.replace("/", "-").strip()}.eml',
+            "timestamp": date.timestamp(),
+            "sender": sender,
             "recipients": recipients,
             "attachments": attachments,
             "search_score": score,
@@ -416,13 +479,13 @@ class Tools:
             return mimetype.startswith(("image/", "audio/", "video/"))
         return False
 
-    def _build_criteria(self, keywords: list) -> list:
+    def _build_criteria(self, keywords: list) -> str:
         if len(keywords) >= 1:
-            keyword = ["TEXT", keywords[0]]
+            keyword = f"(TEXT {json.dumps(keywords[0], ensure_ascii=False)})"
             if len(keywords) >= 2:
-                return ["OR", keyword, self._build_criteria(keywords[1:])]
+                return f"(OR {keyword} {self._build_criteria(keywords[1:])})"
             return keyword
-        return ["ALL"]
+        return "(ALL)"
 
     def _extract_keywords(self, query: str) -> list:
         if query is None or len(query) == 0:
@@ -611,7 +674,11 @@ class Tools:
                 try:
                     # Extract mailbox, UID and filename
                     match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
-                    mailbox, uid, filename = match.group(1, 2, 3)
+                    mailbox, uid, filename = (
+                        match.group(1),
+                        int(match.group(2)),
+                        match.group(3),
+                    )
                     mimetype, encoding = mimetypes.guess_type(filename)
 
                     if not mimetype.startswith("message/"):
