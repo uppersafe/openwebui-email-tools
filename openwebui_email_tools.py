@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.2.0
+version: 1.2.1
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -474,9 +474,13 @@ class Tools:
             reverse=True,
         )[: self.valves.search_count]
 
-    def _is_media(self, mimetype: str) -> bool:
+    def _is_media(
+        self,
+        mimetype: str,
+        checklist: list = ["image/", "audio/", "video/"],
+    ) -> bool:
         if mimetype is not None:
-            return mimetype.startswith(("image/", "audio/", "video/"))
+            return mimetype.startswith(tuple(checklist))
         return False
 
     def _build_criteria(self, keywords: list) -> str:
@@ -500,7 +504,7 @@ class Tools:
 
         # Check that keywords are not empty
         if len(keywords) == 0:
-            raise ValueError("Cannot build keywords from query string")
+            raise ValueError(f"Cannot build keywords from query string '{query}'")
 
         return list(keywords)
 
@@ -538,6 +542,60 @@ class Tools:
         }
         await Config.upsert({cache_key: cache_value})
 
+    async def _upload_file(
+        self,
+        filename: str,
+        mimetype: str,
+        content: bytes,
+        process: bool,
+        user: UserModel,
+        __request__: Request,
+    ) -> tuple:
+        async with get_async_db_context() as db:
+            # Search for file in cache
+            file_hash = blake2b(content).hexdigest()
+            file_id, file_collection = await self._get_cache_file(
+                file_hash,
+                user=user,
+            )
+
+            # Upload file if not in cache
+            if file_id is None:
+                log.info(f"Uploading '{filename}'")
+                file = await upload_file_handler(
+                    __request__,
+                    UploadFile(
+                        file=io.BytesIO(content),
+                        filename=filename,
+                        headers={"content-type": mimetype},
+                    ),
+                    metadata={},
+                    process=False,
+                    user=user,
+                    db=db,
+                )
+                file_id = file.id
+
+            # Process file if not in cache
+            if file_collection is None and process is True:
+                log.info(f"Processing '{filename}'")
+                result = await process_file(
+                    __request__,
+                    ProcessFileForm(file_id=file_id),
+                    user=user,
+                    db=db,
+                )
+                file_collection = result.get("collection_name")
+
+            await self._set_cache_file(
+                file_hash,
+                file_id,
+                file_collection,
+                user=user,
+            )
+
+            return file_id, file_collection
+
     async def _emit_status(
         self,
         event_emitter,
@@ -574,7 +632,7 @@ class Tools:
         :param query: The search query to look up without special operators or wildcards
         :param unread: Flag to only look for new messages
         :param mailboxes: A list of mailboxes to look into (defaults to all except Trash, Bin, Junk and Spam)
-        :return: JSON with search results containing subject, path, timestamp, sender, recipients, attachments and score of each message
+        :return: JSON with results containing subject, path, timestamp, sender, recipients, attachments and search score of each message
         """
         session = None
         try:
@@ -641,7 +699,7 @@ class Tools:
 
         :param query: The search query to use for RAG
         :param messages: A list of path for messages to look into
-        :return: JSON with search results containing EML filename, file ID and snippets for each message
+        :return: JSON with results containing EML filename, file ID and search snippets for each message
         """
         session = None
         try:
@@ -664,16 +722,16 @@ class Tools:
 
             await self._emit_status(
                 __event_emitter__,
-                f"Processing {len(messages)} messages...",
+                f"Inspecting {len(messages)} messages...",
                 done=False,
             )
 
             collections = []
 
-            for path in messages:
+            for message in messages:
                 try:
                     # Extract mailbox, UID and filename
-                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
+                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", message)
                     mailbox, uid, filename = (
                         match.group(1),
                         int(match.group(2)),
@@ -683,57 +741,26 @@ class Tools:
 
                     if not mimetype.startswith("message/"):
                         raise TypeError(f"Invalid message type '{mimetype}'")
-                    else:
-                        log.info(f"Downloading '{path}'")
-                        content = await asyncio.to_thread(
-                            self._download_imap, session, mailbox, uid
-                        )
 
-                    # Search for file in cache
-                    file_hash = blake2b(content).hexdigest()
-                    file_id, file_collection = await self._get_cache_file(
-                        file_hash,
-                        user=user,
+                    log.info(f"Downloading '{message}'")
+                    content = await asyncio.to_thread(
+                        self._download_imap, session, mailbox, uid
                     )
 
-                    # Process file if not in cache
-                    if file_id is None or file_collection is None:
-                        async with get_async_db_context() as db:
-                            log.info(f"Uploading '{filename}'")
-                            file = await upload_file_handler(
-                                __request__,
-                                UploadFile(
-                                    file=io.BytesIO(content),
-                                    filename=filename,
-                                    headers={"content-type": mimetype},
-                                ),
-                                metadata={},
-                                process=False,
-                                user=user,
-                                db=db,
-                            )
-
-                            log.info(f"Processing '{file.path}'")
-                            result = await process_file(
-                                __request__,
-                                ProcessFileForm(file_id=file.id),
-                                user=user,
-                                db=db,
-                            )
-
-                            file_collection = result.get("collection_name")
-
-                            await self._set_cache_file(
-                                file_hash,
-                                file.id,
-                                file_collection,
-                                user=user,
-                            )
+                    # Upload file and process content
+                    file_id, file_collection = await self._upload_file(
+                        filename,
+                        mimetype,
+                        content,
+                        process=True,
+                        user=user,
+                        __request__=__request__,
+                    )
 
                     collections.append(file_collection)
 
                 except Exception as e:
-                    log.warning(f"Cannot process '{path}' ({e})")
+                    log.warning(f"Cannot inspect '{message}' ({e})")
 
             # Query the collection using the retrieval engine
             collection_results = await query_collection_handler(
