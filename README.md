@@ -4,6 +4,8 @@ Search on mail server for information and fetch specific message content using O
 
 ## Features
 
+- Draft new message with plain text or HTML content.
+- Reply to a conversation.
 - Extracts keywords from search query and builds search criteria.
 - Searches for messages in specified mailboxes.
 - Ranks results using similarity scoring and email date.
@@ -47,6 +49,27 @@ Parameters:
 |---|---|
 | `query` | Search query. |
 | `messages` | List of messages. |
+
+Each result contains:
+
+- EML filename
+- Open WebUI file ID
+- Text snippets
+
+### `draft_email_message`
+
+Creates a draft email message by composing a new message or to replying to an existing message.
+
+Parameters:
+
+| Parameter | Description |
+|---|---|
+| `body_text` | Plain-text version of the message body. |
+| `body_html` | HTML version of the message body. |
+| `reply_to` | Path of the message to reply to (optional). |
+| `subject` | Subject of a new message. |
+| `to` | List of recipients for a new message. |
+| `cc` | List of carbon-copy recipients (optional). |
 
 Each result contains:
 

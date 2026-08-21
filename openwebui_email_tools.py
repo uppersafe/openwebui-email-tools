@@ -1051,10 +1051,10 @@ class Tools:
 
         :param body_text: Plain text version of the body
         :param body_html: HTML version of the body
-        :param reply_to: The path of the message to reply to
-        :param subject: The subject of the message (optional for a reply)
-        :param to: A list of recipients (optional for a reply)
-        :param cc: A list of extra recipients for carbon copy (optional)
+        :param reply_to: The path of the message to reply to (optional)
+        :param subject: The subject of a new message (overwritten for a reply)
+        :param to: A list of recipients for a new message (overwritten for a reply)
+        :param cc: A list of extra recipients for carbon copy (optional, overwritten for a reply)
         :return: JSON with result containing subject, path, timestamp, sender and recipients of the draft message
         """
         session = None
@@ -1086,7 +1086,7 @@ class Tools:
             history_text = None
             history_html = None
 
-            if reply_to:
+            if reply_to is not None:
                 path = reply_to
 
                 # Extract mailbox, message ID and filename
