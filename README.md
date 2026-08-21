@@ -71,11 +71,13 @@ Parameters:
 | `to` | List of recipients for a new message. |
 | `cc` | List of carbon-copy recipients (optional). |
 
-Each result contains:
+The result contains:
 
-- EML filename
-- Open WebUI file ID
-- Text snippets
+- Subject
+- Path
+- Timestamp
+- Sender
+- Recipients
 
 ## Installation
 
