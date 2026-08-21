@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.2.1
+version: 1.3.0
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -23,8 +23,12 @@ from hashlib import blake2b
 from difflib import SequenceMatcher
 from fastapi import Request, UploadFile
 from pydantic import BaseModel, Field
+from datetime import datetime
+from html import escape, unescape
+from email import policy, message_from_bytes
+from email.message import EmailMessage
 from email.header import decode_header, make_header
-from email.utils import getaddresses
+from email.utils import getaddresses, formataddr, format_datetime, make_msgid
 from imapclient import IMAPClient
 from imapclient.response_types import Envelope, BodyData
 from imapclient.exceptions import IMAPClientError, LoginError
@@ -70,6 +74,7 @@ class MailClient:
             timeout=10,
         )
         self.mailbox = None
+        self.readonly = None
 
     def login(self, mailaddr: str, password: str) -> None:
         try:
@@ -85,7 +90,7 @@ class MailClient:
         except IMAPClientError as e:
             raise MailException("Unable to logout", e)
 
-    def list(self, ignore: list = []) -> list:
+    def list(self, ignore: list = [], draft: bool = False) -> list:
         try:
             data = self.imap.list_folders()
             if not isinstance(data, list):
@@ -96,18 +101,31 @@ class MailClient:
         mailboxes = []
 
         for flags, delimiter, mailbox in data:
-            if mailbox.upper() not in ignore:
-                mailboxes.append(mailbox)
+            # Check flags if looking for draft mailbox
+            if not draft or rb"\Drafts" in flags:
+                # Check mailbox name against list to ignore
+                if mailbox.upper() not in ignore:
+                    mailboxes.append(mailbox)
 
         return mailboxes
 
-    def select(self, mailbox: str) -> None:
+    def select(self, mailbox: str, readonly: bool = True) -> None:
         try:
-            self.imap.select_folder(mailbox, readonly=True)
+            self.imap.select_folder(mailbox, readonly=readonly)
         except IMAPClientError as e:
             raise MailException(f"Unable to select mailbox {mailbox}", e)
 
         self.mailbox = mailbox
+        self.readonly = readonly
+
+    def append(self, mailbox: str, content: bytes, draft: bool = False) -> None:
+        if mailbox != self.mailbox or self.readonly:
+            self.select(mailbox, readonly=False)
+
+        try:
+            self.imap.append(mailbox, content, flags=[rb"\Draft"] if draft else [])
+        except IMAPClientError as e:
+            raise MailException(f"Unable to draft message in mailbox {mailbox}", e)
 
     def search(self, mailbox: str, criteria: str) -> list:
         if mailbox != self.mailbox:
@@ -121,7 +139,11 @@ class MailClient:
             )
             if response != "OK":
                 raise MailException("Unable to parse response data", data)
-            data = list(map(int, data[0].decode().split(" "))) if len(data[0]) else []
+            data = (
+                list(map(int, data[0].decode().strip().split(" ")))
+                if len(data[0])
+                else []
+            )
             if not isinstance(data, list):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
@@ -323,7 +345,7 @@ class Tools:
         # Look for unread messages only
         criteria = f"(UNSEEN {criteria})" if unread else criteria
 
-        # Retrieve mailboxes
+        # List mailboxes
         if len(mailboxes) == 0:
             mailboxes = session.list(ignore=["TRASH", "BIN", "JUNK", "SPAM"])
 
@@ -344,11 +366,12 @@ class Tools:
                     date = headers.get("Date", None)
                     subject = headers.get("Subject", None)
                     sender = next(iter(headers.get("From", [None])))
-                    tos = headers.get("To", [])
-                    ccs = headers.get("Cc", [])
-                    recipients = []
-                    for name, addr in set(getaddresses(tos + ccs)):
-                        recipients.append(f"{name} <{addr}>")
+                    to = headers.get("To", [])
+                    cc = headers.get("Cc", [])
+                    recipients = [
+                        formataddr((name, addr))
+                        for name, addr in set(getaddresses(to + cc))
+                    ]
 
                     if subject is not None and date is not None and sender is not None:
                         results.append(
@@ -372,6 +395,192 @@ class Tools:
 
     def _download_imap(self, session, mailbox: str, uid: int) -> bytes:
         return session.fetch_raw(mailbox, uid)
+
+    def _write_imap(self, session, msg: EmailMessage) -> tuple:
+        # List draft mailboxes
+        mailboxes = session.list(draft=True)
+
+        if len(mailboxes) != 1:
+            raise ValueError(f"Invalid number of draft mailboxes ({len(mailboxes)})")
+
+        mailbox = next(iter(mailboxes))
+
+        # Add message to mailbox
+        session.append(mailbox, msg.as_bytes(), draft=True)
+
+        # Search for the message
+        message_id = msg.get("Message-ID")
+        criteria = f"(HEADER Message-ID {json.dumps(message_id)})"
+        uids = session.search(mailbox, criteria)
+
+        if len(uids) == 0:
+            raise ValueError(f"Unable to locate the message {message_id}")
+
+        return mailbox, next(iter(uids))
+
+    def _craft_message(
+        self,
+        date: datetime,
+        subject: str,
+        sender: str,
+        to: list,
+        cc: list,
+        references: list,
+        body_text: str,
+        body_html: str,
+        history_text: str,
+        history_html: str,
+    ) -> EmailMessage:
+        msg = EmailMessage(policy=policy.SMTP)
+
+        # Fill headers
+        msg["Message-ID"] = make_msgid(domain=sender.split("@")[-1])
+        msg["Date"] = format_datetime(date)
+
+        if subject:
+            msg["Subject"] = subject
+        if sender:
+            msg["From"] = sender
+        if to:
+            msg["To"] = str(", ").join(to)
+        if cc:
+            msg["Cc"] = str(", ").join(cc)
+        if references:
+            msg["References"] = str(" ").join(references)
+
+        # Merge history with body
+        if body_text is not None and history_text is not None:
+            body_text = f"{body_text}\n\n{history_text}"
+        if body_html is not None and history_html is not None:
+            body_html = f"{body_html}{history_html}"
+
+        # Set plain text body and alternative
+        if body_text is not None:
+            msg.set_content(body_text)
+            if body_html is not None:
+                msg.add_alternative(body_html, subtype="html")
+
+        return msg
+
+    def _build_history(self, msg: EmailMessage) -> tuple:
+        part_text = msg.get_body(preferencelist=("plain",))
+        part_html = msg.get_body(preferencelist=("html",))
+        body_text = None
+        body_html = None
+        history_text = None
+        history_html = None
+
+        if part_text is not None:
+            body_text = part_text.get_content().strip()
+        if part_html is not None:
+            body_html = part_html.get_content().strip()
+            # Remove document wrappers
+            body_html = re.sub(
+                r"^.*?<body[^>]*>",
+                "",
+                body_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            body_html = re.sub(
+                r"</body\s*>.*$",
+                "",
+                body_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+        # Build plain text fallback from HTML
+        if body_text is None and body_html is not None:
+            # Replace HTML line break tag with plain text line break
+            body_text = re.sub(r"<br\s*/?>", "\n", body_html, flags=re.IGNORECASE)
+            # Replace specific HTML end tag with plain text line break
+            body_text = re.sub(
+                r"</(p|div|li|tr|h[1-6])\s*>",
+                "\n",
+                body_text,
+                flags=re.IGNORECASE,
+            )
+            # Remove any other HTML tag
+            body_text = re.sub(r"<[^>]+>", "", body_text)
+            body_text = unescape(body_text).strip()
+
+        # Build HTML fallback from plain text
+        if body_html is None and body_text is not None:
+            # Replace plain text line break with HTML line break tag
+            body_html = (
+                str("<br>")
+                .join(escape(line) for line in body_text.splitlines())
+                .strip()
+            )
+
+        # Format reply history header
+        sender = msg.get("From", None)
+        date = msg.get("Date", None)
+
+        if sender is not None:
+            if date is not None:
+                history_header = f"On {date}, {sender} wrote:"
+            else:
+                history_header = f"{sender} wrote:"
+        else:
+            history_header = "Original message:"
+
+        # Quote reply history
+        if body_text:
+            history_text = str("\n").join(
+                f"> {line}" if line else ">" for line in body_text.splitlines()
+            )
+            history_text = f"{history_header}\n\n{history_text}"
+        if body_html:
+            history_html = (
+                f'<div class="reply-attribution">{escape(history_header)}</div><br>'
+                f'<blockquote type="cite">{body_html}</blockquote>'
+            )
+
+        return history_text, history_html
+
+    def _get_reply_details(self, mailaddr: str, content: bytes) -> tuple:
+        # Parse message content
+        msg = message_from_bytes(content, policy=policy.default)
+
+        # Format subject
+        subject = msg.get("Subject", None)
+        subject = (
+            f"Re: {subject}"
+            if subject is not None and not subject.upper().startswith("RE:")
+            else subject
+        )
+
+        # Set sender as recipient
+        to = msg.get_all("Reply-To", []) or msg.get_all("From", [])
+        to = [
+            formataddr((name, addr))
+            for name, addr in set(getaddresses(to))
+            if addr != mailaddr
+        ]
+
+        # Add extra recipients for carbon copy
+        cc = msg.get_all("To", []) + msg.get_all("Cc", [])
+        cc = [
+            formataddr((name, addr))
+            for name, addr in set(getaddresses(cc))
+            if addr != mailaddr
+        ]
+
+        # Retrieve conversation
+        references = msg.get("References", None) or msg.get("In-Reply-To", None)
+        references = references.strip().split(" ") if references is not None else []
+
+        # Retrieve message ID
+        message_id = msg.get("Message-ID", None)
+
+        # Append message ID to conversation
+        if message_id is not None and message_id not in references:
+            references.append(message_id)
+
+        # Build conversation history
+        history_text, history_html = self._build_history(msg)
+
+        return subject, to, cc, references, history_text, history_html
 
     def _get_credentials(self, config: dict) -> dict:
         if config.mailaddr is None:
@@ -407,7 +616,7 @@ class Tools:
         self,
         mailbox: str,
         uid: int,
-        date: str,
+        date: datetime,
         subject: str,
         sender: str,
         recipients: list,
@@ -460,7 +669,7 @@ class Tools:
         return {
             "subject": subject,
             "path": f'/{mailbox}/{uid}/{subject.replace("/", "-").strip()}.eml',
-            "timestamp": date.timestamp(),
+            "timestamp": int(date.timestamp()),
             "sender": sender,
             "recipients": recipients,
             "attachments": attachments,
@@ -468,6 +677,7 @@ class Tools:
         }
 
     def _sort_results(self, results: list) -> list:
+        # Sort messages by score from newest to oldest
         return sorted(
             results,
             key=lambda result: (result["search_score"], result["timestamp"]),
@@ -629,9 +839,9 @@ class Tools:
         Search for messages on mail server.
         Best to quickly identify relevant messages from INBOX or other mailboxes.
 
-        :param query: The search query to look up without special operators or wildcards
-        :param unread: Flag to only look for new messages
-        :param mailboxes: A list of mailboxes to look into (defaults to all except Trash, Bin, Junk and Spam)
+        :param query: The search query to look up without special operators or wildcards (optional)
+        :param unread: Flag to only look for new messages (optional)
+        :param mailboxes: A list of mailboxes to look into (optional, defaults to all except Trash, Bin, Junk and Spam)
         :return: JSON with results containing subject, path, timestamp, sender, recipients, attachments and search score of each message
         """
         session = None
@@ -728,10 +938,10 @@ class Tools:
 
             collections = []
 
-            for message in messages:
+            for path in messages:
                 try:
                     # Extract mailbox, UID and filename
-                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", message)
+                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
                     mailbox, uid, filename = (
                         match.group(1),
                         int(match.group(2)),
@@ -742,7 +952,7 @@ class Tools:
                     if not mimetype.startswith("message/"):
                         raise TypeError(f"Invalid message type '{mimetype}'")
 
-                    log.info(f"Downloading '{message}'")
+                    log.info(f"Downloading '{path}'")
                     content = await asyncio.to_thread(
                         self._download_imap, session, mailbox, uid
                     )
@@ -760,7 +970,7 @@ class Tools:
                     collections.append(file_collection)
 
                 except Exception as e:
-                    log.warning(f"Cannot inspect '{message}' ({e})")
+                    log.warning(f"Cannot inspect '{path}' ({e})")
 
             # Query the collection using the retrieval engine
             collection_results = await query_collection_handler(
@@ -806,6 +1016,140 @@ class Tools:
             )
 
             return json.dumps(list(results.values()), ensure_ascii=False)
+
+        except MailException as e:
+            log.error(f"{e} = {e.error}")
+            return json.dumps({"error": str(e)})
+
+        except Exception as e:
+            log.exception(e)
+            return json.dumps({"error": str(e)})
+
+        finally:
+            # Disconnect from mail server
+            self._disconnect(session)
+
+    async def draft_email_message(
+        self,
+        body_text: str,
+        body_html: str,
+        reply_to: str = None,
+        subject: str = None,
+        to: list = [],
+        cc: list = [],
+        __request__: Request = None,
+        __user__: dict = None,
+        __event_emitter__=None,
+        __event_call__=None,
+    ) -> str:
+        """
+        Create a draft message on mail server.
+
+        :param body_text: Plain text version of the body
+        :param body_html: HTML version of the body
+        :param reply_to: The path of the message to reply to
+        :param subject: The subject of the message (optional for a reply)
+        :param to: A list of recipients (optional for a reply)
+        :param cc: A list of extra recipients for carbon copy (optional)
+        :return: JSON with result containing subject, path, timestamp, sender and recipients of the draft message
+        """
+        session = None
+        try:
+            if __request__ is None:
+                raise ValueError("Request context not available")
+            if __user__ is None:
+                raise ValueError("User context not available")
+
+            user = UserModel(**__user__)
+            mailaddr, password = self._get_credentials(__user__.get("valves"))
+
+            await self._emit_status(
+                __event_emitter__,
+                "Connecting to mail server...",
+                done=False,
+            )
+
+            # Connect to mail server
+            session = await self._connect_imap(mailaddr, password)
+
+            await self._emit_status(
+                __event_emitter__,
+                f"Drafting message...",
+                done=False,
+            )
+
+            references = []
+            history_text = None
+            history_html = None
+
+            if reply_to:
+                try:
+                    path = reply_to
+
+                    # Extract mailbox, UID and filename
+                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
+                    mailbox, uid, filename = (
+                        match.group(1),
+                        int(match.group(2)),
+                        match.group(3),
+                    )
+                    mimetype, encoding = mimetypes.guess_type(filename)
+
+                    if not mimetype.startswith("message/"):
+                        raise TypeError(f"Invalid message type '{mimetype}'")
+
+                    log.info(f"Downloading '{path}'")
+                    content = await asyncio.to_thread(
+                        self._download_imap, session, mailbox, uid
+                    )
+
+                    # Extract details from message
+                    subject, to, cc, references, history_text, history_html = (
+                        self._get_reply_details(mailaddr, content)
+                    )
+
+                except Exception as e:
+                    log.warning(f"Cannot reply to '{path}' ({e})")
+
+            # Freeze date
+            date = datetime.now().astimezone()
+
+            # Create draft message
+            draft = self._craft_message(
+                date,
+                subject,
+                mailaddr,
+                to,
+                cc,
+                references,
+                body_text,
+                body_html,
+                history_text,
+                history_html,
+            )
+
+            mailbox, uid = await asyncio.to_thread(
+                self._write_imap,
+                session,
+                draft,
+            )
+
+            await self._emit_status(
+                __event_emitter__,
+                f"Draft done.",
+                done=True,
+            )
+
+            return json.dumps(
+                {
+                    "subject": subject,
+                    "path": f'/{mailbox}/{uid}/{subject.replace("/", "-").strip()}.eml',
+                    "timestamp": int(date.timestamp()),
+                    "sender": mailaddr,
+                    "recipients": to + cc,
+                },
+                ensure_ascii=False,
+            )
 
         except MailException as e:
             log.error(f"{e} = {e.error}")
