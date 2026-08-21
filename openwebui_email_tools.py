@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.0
+version: 1.3.1
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -196,6 +196,12 @@ class MailClient:
 
     def get_headers(self, envelope: Envelope) -> dict:
         headers = {}
+        if envelope.message_id is not None:
+            headers.update(
+                {
+                    "Message-ID": envelope.message_id.decode(),
+                }
+            )
         if envelope.date is not None:
             headers.update(
                 {
@@ -363,6 +369,7 @@ class Tools:
                     # Fetch message metadata by UID
                     headers, attachments = session.fetch_metadata(mailbox, uid)
 
+                    message_id = headers.get("Message-ID", None)
                     date = headers.get("Date", None)
                     subject = headers.get("Subject", None)
                     sender = next(iter(headers.get("From", [None])))
@@ -373,19 +380,21 @@ class Tools:
                         for name, addr in set(getaddresses(to + cc))
                     ]
 
-                    if subject is not None and date is not None and sender is not None:
-                        results.append(
-                            self._score_message(
-                                mailbox,
-                                uid,
-                                date,
-                                subject,
-                                sender,
-                                recipients,
-                                attachments,
-                                keywords,
+                    if all([message_id, date, subject, sender]):
+                        # Check that message ID has the correct format
+                        if re.search(r"^(<.+>)$", message_id) is not None:
+                            results.append(
+                                self._score_message(
+                                    mailbox,
+                                    message_id,
+                                    date,
+                                    subject,
+                                    sender,
+                                    recipients,
+                                    attachments,
+                                    keywords,
+                                )
                             )
-                        )
 
             except Exception as e:
                 log.warning(e)
@@ -393,8 +402,15 @@ class Tools:
         # Sort results and return best matches
         return self._sort_results(results)
 
-    def _download_imap(self, session, mailbox: str, uid: int) -> bytes:
-        return session.fetch_raw(mailbox, uid)
+    def _download_imap(self, session, mailbox: str, message_id: str) -> bytes:
+        # Search for the message
+        criteria = f"(HEADER Message-ID {json.dumps(message_id)})"
+        uids = session.search(mailbox, criteria)
+
+        if len(uids) == 0:
+            raise ValueError(f"Unable to find message {message_id}")
+
+        return session.fetch_raw(mailbox, next(iter(uids)))
 
     def _write_imap(self, session, msg: EmailMessage) -> tuple:
         # List draft mailboxes
@@ -408,15 +424,7 @@ class Tools:
         # Add message to mailbox
         session.append(mailbox, msg.as_bytes(), draft=True)
 
-        # Search for the message
-        message_id = msg.get("Message-ID")
-        criteria = f"(HEADER Message-ID {json.dumps(message_id)})"
-        uids = session.search(mailbox, criteria)
-
-        if len(uids) == 0:
-            raise ValueError(f"Unable to locate the message {message_id}")
-
-        return mailbox, next(iter(uids))
+        return mailbox, msg.get("Message-ID")
 
     def _craft_message(
         self,
@@ -615,7 +623,7 @@ class Tools:
     def _score_message(
         self,
         mailbox: str,
-        uid: int,
+        message_id: str,
         date: datetime,
         subject: str,
         sender: str,
@@ -668,7 +676,7 @@ class Tools:
 
         return {
             "subject": subject,
-            "path": f'/{mailbox}/{uid}/{subject.replace("/", "-").strip()}.eml',
+            "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
             "timestamp": int(date.timestamp()),
             "sender": sender,
             "recipients": recipients,
@@ -939,38 +947,34 @@ class Tools:
             collections = []
 
             for path in messages:
-                try:
-                    # Extract mailbox, UID and filename
-                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
-                    mailbox, uid, filename = (
-                        match.group(1),
-                        int(match.group(2)),
-                        match.group(3),
-                    )
-                    mimetype, encoding = mimetypes.guess_type(filename)
+                # Extract mailbox, message ID and filename
+                match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
+                mailbox, message_id, filename = (
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                )
+                mimetype, encoding = mimetypes.guess_type(filename)
 
-                    if not mimetype.startswith("message/"):
-                        raise TypeError(f"Invalid message type '{mimetype}'")
+                if not mimetype.startswith("message/"):
+                    raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
 
-                    log.info(f"Downloading '{path}'")
-                    content = await asyncio.to_thread(
-                        self._download_imap, session, mailbox, uid
-                    )
+                log.info(f"Downloading '{path}'")
+                content = await asyncio.to_thread(
+                    self._download_imap, session, mailbox, message_id
+                )
 
-                    # Upload file and process content
-                    file_id, file_collection = await self._upload_file(
-                        filename,
-                        mimetype,
-                        content,
-                        process=True,
-                        user=user,
-                        __request__=__request__,
-                    )
+                # Upload file and process content
+                file_id, file_collection = await self._upload_file(
+                    filename,
+                    mimetype,
+                    content,
+                    process=True,
+                    user=user,
+                    __request__=__request__,
+                )
 
-                    collections.append(file_collection)
-
-                except Exception as e:
-                    log.warning(f"Cannot inspect '{path}' ({e})")
+                collections.append(file_collection)
 
             # Query the collection using the retrieval engine
             collection_results = await query_collection_handler(
@@ -1083,33 +1087,29 @@ class Tools:
             history_html = None
 
             if reply_to:
-                try:
-                    path = reply_to
+                path = reply_to
 
-                    # Extract mailbox, UID and filename
-                    match = re.search(r"/([^/]+)/([^/]+)/(.*)", path)
-                    mailbox, uid, filename = (
-                        match.group(1),
-                        int(match.group(2)),
-                        match.group(3),
-                    )
-                    mimetype, encoding = mimetypes.guess_type(filename)
+                # Extract mailbox, message ID and filename
+                match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
+                mailbox, message_id, filename = (
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                )
+                mimetype, encoding = mimetypes.guess_type(filename)
 
-                    if not mimetype.startswith("message/"):
-                        raise TypeError(f"Invalid message type '{mimetype}'")
+                if not mimetype.startswith("message/"):
+                    raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
 
-                    log.info(f"Downloading '{path}'")
-                    content = await asyncio.to_thread(
-                        self._download_imap, session, mailbox, uid
-                    )
+                log.info(f"Downloading '{path}'")
+                content = await asyncio.to_thread(
+                    self._download_imap, session, mailbox, message_id
+                )
 
-                    # Extract details from message
-                    subject, to, cc, references, history_text, history_html = (
-                        self._get_reply_details(mailaddr, content)
-                    )
-
-                except Exception as e:
-                    log.warning(f"Cannot reply to '{path}' ({e})")
+                # Extract details from message
+                subject, to, cc, references, history_text, history_html = (
+                    self._get_reply_details(mailaddr, content)
+                )
 
             # Freeze date
             date = datetime.now().astimezone()
@@ -1128,7 +1128,7 @@ class Tools:
                 history_html,
             )
 
-            mailbox, uid = await asyncio.to_thread(
+            mailbox, message_id = await asyncio.to_thread(
                 self._write_imap,
                 session,
                 draft,
@@ -1143,7 +1143,7 @@ class Tools:
             return json.dumps(
                 {
                     "subject": subject,
-                    "path": f'/{mailbox}/{uid}/{subject.replace("/", "-").strip()}.eml',
+                    "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
                     "timestamp": int(date.timestamp()),
                     "sender": mailaddr,
                     "recipients": to + cc,
