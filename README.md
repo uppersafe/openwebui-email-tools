@@ -25,9 +25,9 @@ Parameters:
 
 | Parameter | Description |
 |---|---|
-| `query` | Search query. Default to `None`. |
-| `unread` | Filter on new messages only. Defaults to `False`. |
-| `mailboxes` | Mailboxes to search. Defaults to all except Trash, Bin, Junk and Spam. |
+| `query` | Search query (optional, defaults to `None`). |
+| `unread` | Filter on new messages only (optional, defaults to `False`). |
+| `mailboxes` | Mailboxes to search (optional, defaults to all except Trash, Bin, Junk and Spam). |
 
 Each result contains:
 
