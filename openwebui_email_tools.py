@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.2
+version: 1.3.3
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -40,6 +40,7 @@ from open_webui.models.files import Files
 from open_webui.models.users import UserModel
 from open_webui.internal.db import get_async_db_context
 from open_webui.routers.files import upload_file_handler
+from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.routers.retrieval import (
     ProcessFileForm,
     process_file,
@@ -268,7 +269,7 @@ class MailClient:
         return attachments
 
 
-def with_session(func):
+def with_context(func):
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
         session = None
@@ -791,17 +792,24 @@ class Tools:
         cache_key = f"{self.namespace}.{user.id}.{file_hash}"
         cache_value = await Config.get(cache_key, {})
 
-        if "id" in cache_value:
-            file = await Files.get_file_by_id(cache_value.get("id"))
-            if file is None:
-                log.warning(f"Deleting cache for {cache_key}")
-                await Config.delete(cache_key)
-                cache_value.clear()
+        file_id = cache_value.get("id", None)
+        file_collection = cache_value.get("collection", None)
 
-        return (
-            cache_value.get("id", None),
-            cache_value.get("collection", None),
-        )
+        file = None
+        if file_id is not None:
+            file = await Files.get_file_by_id(file_id)
+
+        collection = None
+        if file_collection is not None:
+            collection = await ASYNC_VECTOR_DB_CLIENT.has_collection(file_collection)
+
+        # Delete cache if file or collection no longer exists
+        if file is None or collection is False:
+            log.warning(f"Deleting cache for {cache_key}")
+            await Config.delete(cache_key)
+            return None, None
+
+        return file_id, file_collection
 
     async def _set_cache_file(
         self,
@@ -890,7 +898,7 @@ class Tools:
                 }
             )
 
-    @with_session
+    @with_context
     async def search_email_messages(
         self,
         query: str = None,
@@ -931,7 +939,7 @@ class Tools:
 
         return json.dumps(list(results), ensure_ascii=False)
 
-    @with_session
+    @with_context
     async def inspect_email_messages(
         self,
         query: str,
@@ -1032,7 +1040,7 @@ class Tools:
 
         return json.dumps(list(results.values()), ensure_ascii=False)
 
-    @with_session
+    @with_context
     async def draft_email_message(
         self,
         body_text: str,
