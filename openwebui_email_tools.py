@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.1
+version: 1.3.2
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -23,6 +23,8 @@ from hashlib import blake2b
 from difflib import SequenceMatcher
 from fastapi import Request, UploadFile
 from pydantic import BaseModel, Field
+from contextvars import ContextVar
+from functools import wraps
 from datetime import datetime
 from html import escape, unescape
 from email import policy, message_from_bytes
@@ -266,6 +268,60 @@ class MailClient:
         return attachments
 
 
+def with_session(func):
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        session = None
+        token = None
+
+        try:
+            __request__ = kwargs.get("__request__", None)
+            __user__ = kwargs.get("__user__", None)
+            __event_emitter__ = kwargs.get("__event_emitter__", None)
+            __event_call__ = kwargs.get("__event_call__", None)
+
+            if __request__ is None:
+                raise ValueError("Request context not available")
+            if __user__ is None:
+                raise ValueError("User context not available")
+
+            user = UserModel(**__user__)
+            mailaddr, password = self._get_credentials(__user__.get("valves"))
+
+            await self._emit_status(
+                __event_emitter__,
+                "Connecting to mail server...",
+                done=False,
+            )
+
+            # Connect to mail server
+            session = await self._connect_imap(mailaddr, password)
+
+            # Set context for this call
+            token = self.context.set((user, session, mailaddr))
+
+            return await func(self, *args, **kwargs)
+
+        except MailException as e:
+            log.error(f"{e} = {e.error}")
+            return json.dumps({"error": str(e)})
+
+        except Exception as e:
+            log.exception(e)
+            return json.dumps({"error": str(e)})
+
+        finally:
+            # Reset context for this call
+            if token is not None:
+                self.context.reset(token)
+
+            # Disconnect from mail server
+            if session is not None:
+                self._disconnect(session)
+
+    return wrapper
+
+
 class Tools:
     class UserValves(BaseModel):
         mailaddr: str = Field(
@@ -316,6 +372,7 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.context = ContextVar("tools.email")
         self.namespace = "tools.email.files"
 
     async def _connect_imap(self, mailaddr: str, password: str) -> MailClient:
@@ -833,6 +890,7 @@ class Tools:
                 }
             )
 
+    @with_session
     async def search_email_messages(
         self,
         query: str = None,
@@ -852,56 +910,28 @@ class Tools:
         :param mailboxes: A list of mailboxes to look into (optional, defaults to all except Trash, Bin, Junk and Spam)
         :return: JSON with results containing subject, path, timestamp, sender, recipients, attachments and search score of each message
         """
-        session = None
-        try:
-            if __request__ is None:
-                raise ValueError("Request context not available")
-            if __user__ is None:
-                raise ValueError("User context not available")
+        user, session, mailaddr = self.context.get()
 
-            user = UserModel(**__user__)
-            mailaddr, password = self._get_credentials(__user__.get("valves"))
+        await self._emit_status(
+            __event_emitter__,
+            "Searching on mail server...",
+            done=False,
+        )
 
-            await self._emit_status(
-                __event_emitter__,
-                "Connecting to mail server...",
-                done=False,
-            )
+        # Browse messages on mail server
+        results = await asyncio.to_thread(
+            self._browse_imap, session, query, unread, mailboxes
+        )
 
-            # Connect to mail server
-            session = await self._connect_imap(mailaddr, password)
+        await self._emit_status(
+            __event_emitter__,
+            f"{len(results)} messages found.",
+            done=True,
+        )
 
-            await self._emit_status(
-                __event_emitter__,
-                "Searching on mail server...",
-                done=False,
-            )
+        return json.dumps(list(results), ensure_ascii=False)
 
-            # Browse messages on mail server
-            results = await asyncio.to_thread(
-                self._browse_imap, session, query, unread, mailboxes
-            )
-
-            await self._emit_status(
-                __event_emitter__,
-                f"{len(results)} messages found.",
-                done=True,
-            )
-
-            return json.dumps(list(results), ensure_ascii=False)
-
-        except MailException as e:
-            log.error(f"{e} = {e.error}")
-            return json.dumps({"error": str(e)})
-
-        except Exception as e:
-            log.exception(e)
-            return json.dumps({"error": str(e)})
-
-        finally:
-            # Disconnect from mail server
-            self._disconnect(session)
-
+    @with_session
     async def inspect_email_messages(
         self,
         query: str,
@@ -919,120 +949,90 @@ class Tools:
         :param messages: A list of path for messages to look into
         :return: JSON with results containing EML filename, file ID and search snippets for each message
         """
-        session = None
-        try:
-            if __request__ is None:
-                raise ValueError("Request context not available")
-            if __user__ is None:
-                raise ValueError("User context not available")
+        user, session, mailaddr = self.context.get()
 
-            user = UserModel(**__user__)
-            mailaddr, password = self._get_credentials(__user__.get("valves"))
+        await self._emit_status(
+            __event_emitter__,
+            f"Inspecting {len(messages)} messages...",
+            done=False,
+        )
 
-            await self._emit_status(
-                __event_emitter__,
-                "Connecting to mail server...",
-                done=False,
+        collections = []
+
+        for path in messages:
+            # Extract mailbox, message ID and filename
+            match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
+            mailbox, message_id, filename = (
+                match.group(1),
+                match.group(2),
+                match.group(3),
+            )
+            mimetype, encoding = mimetypes.guess_type(filename)
+
+            if not mimetype.startswith("message/"):
+                raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
+
+            log.info(f"Downloading '{path}'")
+            content = await asyncio.to_thread(
+                self._download_imap, session, mailbox, message_id
             )
 
-            # Connect to mail server
-            session = await self._connect_imap(mailaddr, password)
-
-            await self._emit_status(
-                __event_emitter__,
-                f"Inspecting {len(messages)} messages...",
-                done=False,
-            )
-
-            collections = []
-
-            for path in messages:
-                # Extract mailbox, message ID and filename
-                match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
-                mailbox, message_id, filename = (
-                    match.group(1),
-                    match.group(2),
-                    match.group(3),
-                )
-                mimetype, encoding = mimetypes.guess_type(filename)
-
-                if not mimetype.startswith("message/"):
-                    raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
-
-                log.info(f"Downloading '{path}'")
-                content = await asyncio.to_thread(
-                    self._download_imap, session, mailbox, message_id
-                )
-
-                # Upload file and process content
-                file_id, file_collection = await self._upload_file(
-                    filename,
-                    mimetype,
-                    content,
-                    process=True,
-                    user=user,
-                    __request__=__request__,
-                )
-
-                collections.append(file_collection)
-
-            # Query the collection using the retrieval engine
-            collection_results = await query_collection_handler(
-                __request__,
-                QueryCollectionsForm(
-                    collection_names=collections,
-                    query=query,
-                ),
+            # Upload file and process content
+            file_id, file_collection = await self._upload_file(
+                filename,
+                mimetype,
+                content,
+                process=True,
                 user=user,
+                __request__=__request__,
             )
 
-            results = {}
+            collections.append(file_collection)
 
-            # Generate query-focused results (instead of relying on raw results)
-            for distances, metadatas, documents in zip(
-                collection_results.get("distances", []),
-                collection_results.get("metadatas", []),
-                collection_results.get("documents", []),
-            ):
-                for distance, metadata, document in zip(
-                    distances, metadatas, documents
-                ):
-                    name = metadata.get("name")
-                    source = metadata.get("file_id")
-                    source_hash = blake2b(source.encode()).hexdigest()
-                    # Get existing snippets if source already in results
-                    snippets = results.get(source_hash, {}).get("snippets", [])
-                    # Add new source to results or update existing source with new snippets
-                    results.update(
-                        {
-                            source_hash: {
-                                "filename": name,
-                                "id": source,
-                                "snippets": snippets + [document],
-                            }
+        # Query the collection using the retrieval engine
+        collection_results = await query_collection_handler(
+            __request__,
+            QueryCollectionsForm(
+                collection_names=collections,
+                query=query,
+            ),
+            user=user,
+        )
+
+        results = {}
+
+        # Generate query-focused results (instead of relying on raw results)
+        for distances, metadatas, documents in zip(
+            collection_results.get("distances", []),
+            collection_results.get("metadatas", []),
+            collection_results.get("documents", []),
+        ):
+            for distance, metadata, document in zip(distances, metadatas, documents):
+                name = metadata.get("name")
+                source = metadata.get("file_id")
+                source_hash = blake2b(source.encode()).hexdigest()
+                # Get existing snippets if source already in results
+                snippets = results.get(source_hash, {}).get("snippets", [])
+                # Add new source to results or update existing source with new snippets
+                results.update(
+                    {
+                        source_hash: {
+                            "filename": name,
+                            "id": source,
+                            "snippets": snippets + [document],
                         }
-                    )
+                    }
+                )
 
-            await self._emit_status(
-                __event_emitter__,
-                f"{len(results)} results found.",
-                done=True,
-            )
+        await self._emit_status(
+            __event_emitter__,
+            f"{len(results)} results found.",
+            done=True,
+        )
 
-            return json.dumps(list(results.values()), ensure_ascii=False)
+        return json.dumps(list(results.values()), ensure_ascii=False)
 
-        except MailException as e:
-            log.error(f"{e} = {e.error}")
-            return json.dumps({"error": str(e)})
-
-        except Exception as e:
-            log.exception(e)
-            return json.dumps({"error": str(e)})
-
-        finally:
-            # Disconnect from mail server
-            self._disconnect(session)
-
+    @with_session
     async def draft_email_message(
         self,
         body_text: str,
@@ -1057,108 +1057,79 @@ class Tools:
         :param cc: A list of extra recipients for carbon copy (optional, overwritten for a reply)
         :return: JSON with result containing subject, path, timestamp, sender and recipients of the draft message
         """
-        session = None
-        try:
-            if __request__ is None:
-                raise ValueError("Request context not available")
-            if __user__ is None:
-                raise ValueError("User context not available")
+        user, session, mailaddr = self.context.get()
 
-            user = UserModel(**__user__)
-            mailaddr, password = self._get_credentials(__user__.get("valves"))
+        await self._emit_status(
+            __event_emitter__,
+            f"Drafting message...",
+            done=False,
+        )
 
-            await self._emit_status(
-                __event_emitter__,
-                "Connecting to mail server...",
-                done=False,
+        references = []
+        history_text = None
+        history_html = None
+
+        if reply_to is not None:
+            path = reply_to
+
+            # Extract mailbox, message ID and filename
+            match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
+            mailbox, message_id, filename = (
+                match.group(1),
+                match.group(2),
+                match.group(3),
+            )
+            mimetype, encoding = mimetypes.guess_type(filename)
+
+            if not mimetype.startswith("message/"):
+                raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
+
+            log.info(f"Downloading '{path}'")
+            content = await asyncio.to_thread(
+                self._download_imap, session, mailbox, message_id
             )
 
-            # Connect to mail server
-            session = await self._connect_imap(mailaddr, password)
-
-            await self._emit_status(
-                __event_emitter__,
-                f"Drafting message...",
-                done=False,
+            # Extract details from message
+            subject, to, cc, references, history_text, history_html = (
+                self._get_reply_details(mailaddr, content)
             )
 
-            references = []
-            history_text = None
-            history_html = None
+        # Freeze date
+        date = datetime.now().astimezone()
 
-            if reply_to is not None:
-                path = reply_to
+        # Create draft message
+        draft = self._craft_message(
+            date,
+            subject,
+            mailaddr,
+            to,
+            cc,
+            references,
+            body_text,
+            body_html,
+            history_text,
+            history_html,
+        )
 
-                # Extract mailbox, message ID and filename
-                match = re.search(r"/([^/]+)/(<[^>]+>)/(.*)", path)
-                mailbox, message_id, filename = (
-                    match.group(1),
-                    match.group(2),
-                    match.group(3),
-                )
-                mimetype, encoding = mimetypes.guess_type(filename)
+        mailbox, message_id = await asyncio.to_thread(
+            self._write_imap,
+            session,
+            draft,
+        )
 
-                if not mimetype.startswith("message/"):
-                    raise TypeError(f"Invalid mimetype '{mimetype}' for '{path}'")
+        await self._emit_status(
+            __event_emitter__,
+            f"Draft done.",
+            done=True,
+        )
 
-                log.info(f"Downloading '{path}'")
-                content = await asyncio.to_thread(
-                    self._download_imap, session, mailbox, message_id
-                )
-
-                # Extract details from message
-                subject, to, cc, references, history_text, history_html = (
-                    self._get_reply_details(mailaddr, content)
-                )
-
-            # Freeze date
-            date = datetime.now().astimezone()
-
-            # Create draft message
-            draft = self._craft_message(
-                date,
-                subject,
-                mailaddr,
-                to,
-                cc,
-                references,
-                body_text,
-                body_html,
-                history_text,
-                history_html,
-            )
-
-            mailbox, message_id = await asyncio.to_thread(
-                self._write_imap,
-                session,
-                draft,
-            )
-
-            await self._emit_status(
-                __event_emitter__,
-                f"Draft done.",
-                done=True,
-            )
-
-            return json.dumps(
-                {
-                    "subject": subject,
-                    "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
-                    "timestamp": int(date.timestamp()),
-                    "sender": mailaddr,
-                    "recipients": to + cc,
-                },
-                ensure_ascii=False,
-            )
-
-        except MailException as e:
-            log.error(f"{e} = {e.error}")
-            return json.dumps({"error": str(e)})
-
-        except Exception as e:
-            log.exception(e)
-            return json.dumps({"error": str(e)})
-
-        finally:
-            # Disconnect from mail server
-            self._disconnect(session)
+        return json.dumps(
+            {
+                "subject": subject,
+                "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
+                "timestamp": int(date.timestamp()),
+                "sender": mailaddr,
+                "recipients": to + cc,
+            },
+            ensure_ascii=False,
+        )
