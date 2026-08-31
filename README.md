@@ -57,9 +57,9 @@ Each result contains:
 - Open WebUI file ID
 - Text snippets
 
-### `draft_email_message`
+### `write_email_message`
 
-Creates a draft email message by composing a new message or to replying to an existing message.
+Creates a draft email by composing a new message or to replying to an existing message.
 
 Parameters:
 

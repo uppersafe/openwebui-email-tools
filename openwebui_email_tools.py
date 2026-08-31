@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.4
+version: 1.3.5
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -471,23 +471,9 @@ class Tools:
 
         return session.fetch_raw(mailbox, next(iter(uids)))
 
-    def _write_imap(self, session, msg: EmailMessage) -> tuple:
-        # List draft mailboxes
-        mailboxes = session.list(draft=True)
-
-        if len(mailboxes) != 1:
-            raise ValueError(f"Invalid number of draft mailboxes ({len(mailboxes)})")
-
-        mailbox = next(iter(mailboxes))
-
-        # Add message to mailbox
-        session.append(mailbox, msg.as_bytes(), draft=True)
-
-        return mailbox, msg.get("Message-ID")
-
-    def _craft_message(
+    def _draft_imap(
         self,
-        date: datetime,
+        session,
         subject: str,
         sender: str,
         to: list,
@@ -495,13 +481,27 @@ class Tools:
         references: list,
         body_text: str,
         body_html: str,
-        history_text: str,
-        history_html: str,
-    ) -> EmailMessage:
+    ) -> dict:
+        # List draft mailboxes
+        mailboxes = session.list(draft=True)
+
+        if len(mailboxes) != 1:
+            raise ValueError(f"Invalid number of draft mailboxes ({len(mailboxes)})")
+
+        # Select draft mailbox
+        mailbox = next(iter(mailboxes))
+
+        # Generate message ID
+        message_id = make_msgid(domain=sender.split("@")[-1])
+
+        # Freeze date
+        date = datetime.now().astimezone()
+
+        # Create draft message
         msg = EmailMessage(policy=policy.SMTP)
 
         # Fill headers
-        msg["Message-ID"] = make_msgid(domain=sender.split("@")[-1])
+        msg["Message-ID"] = message_id
         msg["Date"] = format_datetime(date)
 
         if subject:
@@ -515,19 +515,23 @@ class Tools:
         if references:
             msg["References"] = str(" ").join(references)
 
-        # Merge history with body
-        if body_text is not None and history_text is not None:
-            body_text = f"{body_text}\n\n{history_text}"
-        if body_html is not None and history_html is not None:
-            body_html = f"{body_html}{history_html}"
-
         # Set plain text body and alternative
         if body_text is not None:
             msg.set_content(body_text)
             if body_html is not None:
                 msg.add_alternative(body_html, subtype="html")
 
-        return msg
+        # Add message to mailbox
+        session.append(mailbox, msg.as_bytes(), draft=True)
+
+        return self._format_result(
+            mailbox,
+            message_id,
+            date,
+            subject,
+            sender,
+            to + cc,
+        )
 
     def _build_history(self, msg: EmailMessage) -> tuple:
         part_text = msg.get_body(preferencelist=("plain",))
@@ -735,16 +739,41 @@ class Tools:
                 for match_size in self._seq_match(attachment, keywords)
             )
 
-        return {
+        return self._format_result(
+            mailbox,
+            message_id,
+            date,
+            subject,
+            sender,
+            recipients,
+            attachments,
+            score,
+        )
+
+    def _format_result(
+        self,
+        mailbox: str,
+        message_id: str,
+        date: datetime,
+        subject: str,
+        sender: str,
+        recipients: list,
+        attachments: list = None,
+        score: float = None,
+    ) -> dict:
+        result = {
             "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
             "date": date.isoformat(),
             "mailbox": mailbox,
             "subject": subject,
             "sender": sender,
             "recipients": recipients,
-            "attachments": attachments,
-            "score": score,
         }
+        if attachments is not None:
+            result.update({"attachments": attachments})
+        if score is not None:
+            result.update({"score": score})
+        return result
 
     def _sort_results(self, results: list, keys: list) -> list:
         # Sort by keys from lowest to highest priority
@@ -1043,7 +1072,7 @@ class Tools:
         return json.dumps(list(results.values()), ensure_ascii=False)
 
     @with_context
-    async def draft_email_message(
+    async def write_email_message(
         self,
         body_text: str,
         body_html: str,
@@ -1057,7 +1086,7 @@ class Tools:
         __event_call__=None,
     ) -> str:
         """
-        Create a draft message on mail server.
+        Write a draft message on mail server.
 
         :param body_text: Plain text version of the body
         :param body_html: HTML version of the body
@@ -1104,12 +1133,15 @@ class Tools:
                 self._get_reply_details(mailaddr, content)
             )
 
-        # Freeze date
-        date = datetime.now().astimezone()
+            # Merge history with body
+            if body_text is not None and history_text is not None:
+                body_text = f"{body_text}\n\n{history_text}"
+            if body_html is not None and history_html is not None:
+                body_html = f"{body_html}{history_html}"
 
-        # Create draft message
-        draft = self._craft_message(
-            date,
+        result = await asyncio.to_thread(
+            self._draft_imap,
+            session,
             subject,
             mailaddr,
             to,
@@ -1117,14 +1149,6 @@ class Tools:
             references,
             body_text,
             body_html,
-            history_text,
-            history_html,
-        )
-
-        mailbox, message_id = await asyncio.to_thread(
-            self._write_imap,
-            session,
-            draft,
         )
 
         await self._emit_status(
@@ -1133,14 +1157,4 @@ class Tools:
             done=True,
         )
 
-        return json.dumps(
-            {
-                "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
-                "date": date.isoformat(),
-                "mailbox": mailbox,
-                "subject": subject,
-                "sender": mailaddr,
-                "recipients": to + cc,
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps(result, ensure_ascii=False)
