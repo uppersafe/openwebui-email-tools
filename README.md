@@ -25,15 +25,16 @@ Parameters:
 
 | Parameter | Description |
 |---|---|
-| `query` | Search query (optional, defaults to `None`). |
-| `unread` | Filter on new messages only (optional, defaults to `False`). |
+| `query` | Search query (optional). |
+| `unread` | Filter on new messages only (optional). |
 | `mailboxes` | Mailboxes to search (optional, defaults to all except Trash, Bin, Junk and Spam). |
 
 Each result contains:
 
+- Virtual path
+- Date
+- Mailbox
 - Subject
-- Path
-- Timestamp
 - Sender
 - Recipients
 - Attachments
@@ -73,9 +74,10 @@ Parameters:
 
 The result contains:
 
+- Virtual path
+- Date
+- Mailbox
 - Subject
-- Path
-- Timestamp
 - Sender
 - Recipients
 

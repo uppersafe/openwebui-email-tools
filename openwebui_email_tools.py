@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.3
+version: 1.3.4
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -208,7 +208,7 @@ class MailClient:
         if envelope.date is not None:
             headers.update(
                 {
-                    "Date": envelope.date,
+                    "Date": envelope.date.astimezone(),
                 }
             )
         if envelope.subject is not None:
@@ -328,6 +328,7 @@ class Tools:
         mailaddr: str = Field(
             title="Email address",
             default=None,
+            pattern="^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]+$",
         )
         password: str = Field(
             title="Email password",
@@ -413,8 +414,8 @@ class Tools:
         if len(mailboxes) == 0:
             mailboxes = session.list(ignore=["TRASH", "BIN", "JUNK", "SPAM"])
 
-        for mailbox in mailboxes:
-            try:
+        try:
+            for mailbox in mailboxes:
                 if int(time.monotonic()) >= timeout:
                     raise TimeoutError(
                         f"Timeout of search task after {self.valves.search_timeout} secs"
@@ -454,11 +455,11 @@ class Tools:
                                 )
                             )
 
-            except Exception as e:
-                log.warning(e)
+        except TimeoutError as e:
+            log.warning(e)
 
         # Sort results and return best matches
-        return self._sort_results(results)
+        return self._sort_results(results, [("score", True), ("date", True)])
 
     def _download_imap(self, session, mailbox: str, message_id: str) -> bytes:
         # Search for the message
@@ -698,17 +699,19 @@ class Tools:
         # Calculate the weight of one character
         match_weight = 1.0 / max(1.0, total_length)
 
-        # Calculate match with subject
-        score = score + sum(
-            match_size * match_weight
-            for match_size in self._seq_match(subject, keywords)
-        )
+        if subject is not None:
+            # Calculate match with subject
+            score = score + sum(
+                match_size * match_weight
+                for match_size in self._seq_match(subject, keywords)
+            )
 
-        # Calculate match with sender
-        score = score + sum(
-            match_size * match_weight
-            for match_size in self._seq_match(sender, keywords)
-        )
+        if sender is not None:
+            # Calculate match with sender
+            score = score + sum(
+                match_size * match_weight
+                for match_size in self._seq_match(sender, keywords)
+            )
 
         for recipient in recipients:
             # Calculate match with recipient
@@ -733,22 +736,21 @@ class Tools:
             )
 
         return {
-            "subject": subject,
             "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
-            "timestamp": int(date.timestamp()),
+            "date": date.isoformat(),
+            "mailbox": mailbox,
+            "subject": subject,
             "sender": sender,
             "recipients": recipients,
             "attachments": attachments,
-            "search_score": score,
+            "score": score,
         }
 
-    def _sort_results(self, results: list) -> list:
-        # Sort messages by score from newest to oldest
-        return sorted(
-            results,
-            key=lambda result: (result["search_score"], result["timestamp"]),
-            reverse=True,
-        )[: self.valves.search_count]
+    def _sort_results(self, results: list, keys: list) -> list:
+        # Sort by keys from lowest to highest priority
+        for key, reverse in reversed(keys):
+            results.sort(key=lambda result: result[key], reverse=reverse)
+        return results[: self.valves.search_count]
 
     def _is_media(
         self,
@@ -768,7 +770,7 @@ class Tools:
         return "(ALL)"
 
     def _extract_keywords(self, query: str) -> list:
-        if query is None or len(query) == 0:
+        if query is None or len(query.strip()) == 0:
             return []
 
         # Split query on special characters (space, tab, comma, etc) and remove linking words
@@ -913,10 +915,10 @@ class Tools:
         Search for messages on mail server.
         Best to quickly identify relevant messages from INBOX or other mailboxes.
 
-        :param query: The search query to look up without special operators or wildcards (optional)
+        :param query: The search keywords to look up without special operators or wildcards (optional)
         :param unread: Flag to only look for new messages (optional)
-        :param mailboxes: A list of mailboxes to look into (optional, defaults to all except Trash, Bin, Junk and Spam)
-        :return: JSON with results containing subject, path, timestamp, sender, recipients, attachments and search score of each message
+        :param mailboxes: A list of mailboxes to look into (optional, defaults to all except "Trash", "Bin", "Junk" and "Spam")
+        :return: JSON with results containing virtual path, date, mailbox, subject, sender, recipients, attachments and search score of each message
         """
         user, session, mailaddr = self.context.get()
 
@@ -953,7 +955,7 @@ class Tools:
         Search for information in specific messages on mail server.
         Best for efficient content retrieval.
 
-        :param query: The search query to use for RAG
+        :param query: The search query to look up with the RAG engine
         :param messages: A list of path for messages to look into
         :return: JSON with results containing EML filename, file ID and search snippets for each message
         """
@@ -1063,7 +1065,7 @@ class Tools:
         :param subject: The subject of a new message (overwritten for a reply)
         :param to: A list of recipients for a new message (overwritten for a reply)
         :param cc: A list of extra recipients for carbon copy (optional, overwritten for a reply)
-        :return: JSON with result containing subject, path, timestamp, sender and recipients of the draft message
+        :return: JSON with result containing virtual path, date, mailbox, subject, sender and recipients of the draft message
         """
         user, session, mailaddr = self.context.get()
 
@@ -1133,9 +1135,10 @@ class Tools:
 
         return json.dumps(
             {
-                "subject": subject,
                 "path": f'/{mailbox}/{message_id}/{subject.replace("/", "-").strip()}.eml',
-                "timestamp": int(date.timestamp()),
+                "date": date.isoformat(),
+                "mailbox": mailbox,
+                "subject": subject,
                 "sender": mailaddr,
                 "recipients": to + cc,
             },
