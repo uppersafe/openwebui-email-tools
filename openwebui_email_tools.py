@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.5
+version: 1.3.6
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -76,7 +76,8 @@ class MailClient:
             ssl_context=ssl_context,
             timeout=10,
         )
-        self.mailbox = None
+        self.mailboxes = None
+        self.selection = None
         self.readonly = None
 
     def login(self, mailaddr: str, password: str) -> None:
@@ -101,37 +102,41 @@ class MailClient:
         except IMAPClientError as e:
             raise MailException("Unable to list mailboxes", e)
 
-        mailboxes = []
+        self.mailboxes = {}
 
         for flags, delimiter, mailbox in data:
             # Check flags if looking for draft mailbox
             if not draft or rb"\Drafts" in flags:
                 # Check mailbox name against list to ignore
                 if mailbox.upper() not in ignore:
-                    mailboxes.append(mailbox)
+                    self.mailboxes.update({mailbox: flags})
 
-        return mailboxes
+        return list(self.mailboxes)
 
     def select(self, mailbox: str, readonly: bool = True) -> None:
+        mailboxes = self.list() if self.mailboxes is None else list(self.mailboxes)
+        if mailbox not in mailboxes:
+            raise MailException(f"Unable to find '{mailbox}' among {mailboxes}")
+
         try:
             self.imap.select_folder(mailbox, readonly=readonly)
         except IMAPClientError as e:
-            raise MailException(f"Unable to select mailbox {mailbox}", e)
+            raise MailException(f"Unable to select mailbox '{mailbox}'", e)
 
-        self.mailbox = mailbox
+        self.selection = mailbox
         self.readonly = readonly
 
     def append(self, mailbox: str, content: bytes, draft: bool = False) -> None:
-        if mailbox != self.mailbox or self.readonly:
+        if mailbox != self.selection or self.readonly:
             self.select(mailbox, readonly=False)
 
         try:
             self.imap.append(mailbox, content, flags=[rb"\Draft"] if draft else [])
         except IMAPClientError as e:
-            raise MailException(f"Unable to draft message in mailbox {mailbox}", e)
+            raise MailException(f"Unable to draft message in '{mailbox}'", e)
 
     def search(self, mailbox: str, criteria: str) -> list:
-        if mailbox != self.mailbox:
+        if mailbox != self.selection:
             self.select(mailbox)
 
         try:
@@ -150,7 +155,7 @@ class MailClient:
             if not isinstance(data, list):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
-            raise MailException(f"Unable to search mailbox {mailbox}", e)
+            raise MailException(f"Unable to search mailbox '{mailbox}'", e)
 
         return data
 
@@ -159,7 +164,7 @@ class MailClient:
         mailbox: str,
         uid: int,
     ) -> bytes:
-        if mailbox != self.mailbox:
+        if mailbox != self.selection:
             self.select(mailbox)
 
         try:
@@ -170,7 +175,7 @@ class MailClient:
             if not isinstance(data, dict):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
-            raise MailException(f"Unable to fetch msg {uid} from mailbox {mailbox}", e)
+            raise MailException(f"Unable to fetch message {uid} from '{mailbox}'", e)
 
         return data.get(b"BODY[]", None)
 
@@ -179,7 +184,7 @@ class MailClient:
         mailbox: str,
         uid: int,
     ) -> tuple:
-        if mailbox != self.mailbox:
+        if mailbox != self.selection:
             self.select(mailbox)
 
         try:
@@ -190,7 +195,7 @@ class MailClient:
             if not isinstance(data, dict):
                 raise MailException("Unable to parse response data", data)
         except IMAPClientError as e:
-            raise MailException(f"Unable to fetch msg {uid} from mailbox {mailbox}", e)
+            raise MailException(f"Unable to fetch message {uid} from '{mailbox}'", e)
 
         envelope = data.get(b"ENVELOPE", None)
         bodystructure = data.get(b"BODYSTRUCTURE", None)
@@ -295,7 +300,7 @@ def with_context(func):
                 done=False,
             )
 
-            # Connect to mail server
+            # Connect to server
             session = await self._connect_imap(mailaddr, password)
 
             # Set context for this call
@@ -304,7 +309,7 @@ def with_context(func):
             return await func(self, *args, **kwargs)
 
         except MailException as e:
-            log.error(f"{e} = {e.error}")
+            log.error(f"{e} ({e.error})" if e.error else str(e))
             return json.dumps({"error": str(e)})
 
         except Exception as e:
@@ -316,7 +321,7 @@ def with_context(func):
             if token is not None:
                 self.context.reset(token)
 
-            # Disconnect from mail server
+            # Disconnect from server
             if session is not None:
                 self._disconnect(session)
 
@@ -495,7 +500,7 @@ class Tools:
         message_id = make_msgid(domain=sender.split("@")[-1])
 
         # Freeze date
-        date = datetime.now().astimezone()
+        date = datetime.now().replace(microsecond=0).astimezone()
 
         # Create draft message
         msg = EmailMessage(policy=policy.SMTP)
@@ -514,6 +519,7 @@ class Tools:
             msg["Cc"] = str(", ").join(cc)
         if references:
             msg["References"] = str(" ").join(references)
+            msg["In-Reply-To"] = references[-1]
 
         # Set plain text body and alternative
         if body_text is not None:
@@ -524,13 +530,20 @@ class Tools:
         # Add message to mailbox
         session.append(mailbox, msg.as_bytes(), draft=True)
 
+        # Merge recipients
+        recipients = (to or []) + (cc or [])
+
+        # Declare attachments as empty
+        attachments = []
+
         return self._format_result(
             mailbox,
             message_id,
             date,
             subject,
             sender,
-            to + cc,
+            recipients,
+            attachments,
         )
 
     def _build_history(self, msg: EmailMessage) -> tuple:
@@ -758,7 +771,7 @@ class Tools:
         subject: str,
         sender: str,
         recipients: list,
-        attachments: list = None,
+        attachments: list,
         score: float = None,
     ) -> dict:
         result = {
@@ -768,9 +781,8 @@ class Tools:
             "subject": subject,
             "sender": sender,
             "recipients": recipients,
+            "attachments": attachments,
         }
-        if attachments is not None:
-            result.update({"attachments": attachments})
         if score is not None:
             result.update({"score": score})
         return result
@@ -953,7 +965,7 @@ class Tools:
 
         await self._emit_status(
             __event_emitter__,
-            "Searching on mail server...",
+            "Searching for messages...",
             done=False,
         )
 
@@ -1078,8 +1090,8 @@ class Tools:
         body_html: str,
         reply_to: str = None,
         subject: str = None,
-        to: list = [],
-        cc: list = [],
+        to: list = None,
+        cc: list = None,
         __request__: Request = None,
         __user__: dict = None,
         __event_emitter__=None,
@@ -1153,7 +1165,7 @@ class Tools:
 
         await self._emit_status(
             __event_emitter__,
-            f"Draft done.",
+            f"Message draft done.",
             done=True,
         )
 

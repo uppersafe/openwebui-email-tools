@@ -4,14 +4,13 @@ Search on mail server for information and fetch specific message content using O
 
 ## Features
 
-- Draft new message with plain text or HTML content.
-- Reply to a conversation.
-- Extracts keywords from search query and builds search criteria.
+- Writes new messages with plain text or HTML content.
+- Replies to conversations and threads.
 - Searches for messages in specified mailboxes.
-- Ranks results using similarity scoring and email date.
+- Ranks search results using keywords scoring and email date.
 - Downloads messages and processes content.
-- Caches uploaded messages by content hash to avoid processing same messages multiple times.
-- Inspects messages and retrieve relevant parts.
+- Caches messages by content hash.
+- Inspects messages and retrieves relevant parts.
 - Stores credentials in User Valves settings.
 - Supports IMAP protocol
 
@@ -21,7 +20,7 @@ Search on mail server for information and fetch specific message content using O
 
 Searches for messages on the mail server and returns metadata.
 
-Parameters:
+Input parameters:
 
 | Parameter | Description |
 |---|---|
@@ -29,7 +28,7 @@ Parameters:
 | `unread` | Filter on new messages only (optional). |
 | `mailboxes` | Mailboxes to search (optional, defaults to all except Trash, Bin, Junk and Spam). |
 
-Each result contains:
+The output contains for each result:
 
 - Virtual path
 - Date
@@ -42,16 +41,16 @@ Each result contains:
 
 ### `inspect_email_messages`
 
-Inspects specific messages content and uses Open WebUI's retrieval engine to fetch relevant parts.
+Retrieves specific messages from the mail server and uses Open WebUI's retrieval engine to find relevant parts.
 
-Parameters:
+Input parameters:
 
 | Parameter | Description |
 |---|---|
 | `query` | Search query. |
 | `messages` | List of messages. |
 
-Each result contains:
+The output contains for each result:
 
 - EML filename
 - Open WebUI file ID
@@ -59,9 +58,9 @@ Each result contains:
 
 ### `write_email_message`
 
-Creates a draft email by composing a new message or to replying to an existing message.
+Creates a draft email by composing a new message or by replying to an existing message.
 
-Parameters:
+Input parameters:
 
 | Parameter | Description |
 |---|---|
@@ -72,7 +71,7 @@ Parameters:
 | `to` | List of recipients for a new message. |
 | `cc` | List of carbon-copy recipients (optional). |
 
-The result contains:
+The output contains:
 
 - Virtual path
 - Date
@@ -80,6 +79,7 @@ The result contains:
 - Subject
 - Sender
 - Recipients
+- Attachments
 
 ## Installation
 
