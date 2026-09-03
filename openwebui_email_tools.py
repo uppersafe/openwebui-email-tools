@@ -4,7 +4,7 @@ author: Nicolas THIBAUT
 git_url: https://github.com/uppersafe/
 description: Search on mail server for information and fetch specific message content.
 license: AGPL-3.0-only
-version: 1.3.6
+version: 1.3.7
 required_open_webui_version: 0.10.2
 requirements: imapclient
 """
@@ -838,16 +838,20 @@ class Tools:
         file_id = cache_value.get("id", None)
         file_collection = cache_value.get("collection", None)
 
-        file = None
+        cleanup = False
+
         if file_id is not None:
             file = await Files.get_file_by_id(file_id)
+            if not file:
+                cleanup = True
 
-        collection = None
         if file_collection is not None:
             collection = await ASYNC_VECTOR_DB_CLIENT.has_collection(file_collection)
+            if not collection:
+                cleanup = True
 
-        # Delete cache if file or collection no longer exists
-        if file is None or collection is False:
+        # Delete cache if file or collection no longer exist
+        if cleanup:
             log.warning(f"Deleting cache for {cache_key}")
             await Config.delete(cache_key)
             return None, None
